@@ -1,0 +1,330 @@
+epoch: 500
+rqvae_epochs: 120
+optim: Adam
+embedding_size: 128
+intra_domain_layers: 2
+# U-I LightGCN propagation depth (STPD only). Its input is the U/I-Tag
+# graph output, and it remains decoupled from `intra_domain_layers`.
+# If unset, falls back to `intra_domain_layers`.
+ui_graph_layers: 2
+reg_weight: 0.0001
+batch_size: 2048
+eval_batch_size: 4096
+drop_rate: 0
+# Keep RQ-VAE tag graphs, but do not transfer teacher_pretrain.pt by default.
+# Set true only for the explicit teacher-initialisation ablation.
+use_teacher_pretrain: false
+# Keep normal STPD's trainable I-Tag item tables on the legacy Xavier
+# random initialisation instead of injecting offline PCA content embeddings.
+# `wocross` keeps its independent legacy lookup path.
+use_pca_item_init: false
+# Copied PCA artifacts may record a source path/mtime from another machine.
+# Keep false to trust a cache whose domains, dimensions and row counts match.
+pca_item_validate_source: false
+# Tag graph topology still comes from the RQ-VAE codes. For the embedding
+# initialisation ablation use `random`; switch to `rqvae` for codebook vectors.
+tag_embedding_init: rqvae
+# Ablation: `none` uses real RQ-VAE codes; `shuffle` permutes item->code
+# assignments per domain (preserving cluster sizes and the Tag1-Tag2 edge
+# structure) to test whether semantic clustering matters or any random
+# partition of the same shape works equally well.
+tag_codes: none
+# Ablation: `free` = item Tag-anchor is a free nn.Embedding (default, can be
+# row-wise absorbed by the model). `content_proj` = freeze PCA content as the
+# anchor and learn only a 128x128 projection, so no per-item free parameter
+# exists and the Tag graph's cross-item smoothing becomes a real constraint.
+# Requires use_pca_item_init: true.
+item_anchor_mode: free
+# How the private/shared user split is produced.
+#   `gate`  : learned sigmoid gate on the LightGCN output (original). The
+#             shared branch is a free vector, so shared_cross_bpr / MMD
+#             gradients never reach the Tag parameters.
+#   `tag2`  : shared branch IS the Tag2 contribution of the Tag graph, so the
+#             shared-branch losses backpropagate through the shared Tag2
+#             bridge. Makes Tag load-bearing without adding a loss term.
+shared_split_mode: gate
+
+# Tag-graph topology.
+#   chain    : anchor - Tag1 - Tag2   (legacy; Tag2 is two hops from anchors)
+#   parallel : anchor - Tag1 and anchor - Tag2 as independent one-hop channels
+#   swapped  : anchor - Tag2 - Tag1   (swap propagation levels for ablation)
+# `chain` washes the per-anchor Tag2 signal out to a near-constant vector
+# because Tag1/Tag2 are nearly independent, making Tag1-Tag2 almost complete.
+tag_graph_topology: chain
+lambda_u_tag_sparse: 0
+lambda_i_tag_sparse: 0
+
+# Overlap-only item InfoNCE on the shared branch (`_xd_infonce_loss`).
+# Only users with u < n_shared act as anchors. For each anchor, two standard
+# 1-positive InfoNCE terms are averaged:
+#   - self positive: the batch positive item carried by this training sample
+#   - other positive: one random training positive of the same overlap user
+#                     in the other domain
+# Negatives are the in-batch positive items from BOTH domains, following Lna.
+align_weight: 0
+align_temp: 0.2
+ortho_weight: 0.05
+
+# Domain disentanglement immediately after the private/shared gate:
+#   - shared branch: domain discriminator + GRL (domain-adversarial)
+#   - private branch: same two-layer MLP discriminator, no GRL
+# Both losses use current-batch unique users from the two domains.
+shared_domain_adv_weight: 0
+private_domain_cls_weight: 0
+domain_grl_lambda: 1.0
+domain_disc_hidden_dim: 128
+
+# Lna: in-batch negative contrastive loss (no filtering)
+lna_weight: 0.7
+lna_temp: 0.2
+
+# Pseudo-overlap alignment via interacted-item Tag2 profile similarity.
+# ALL users (overlap + non-overlap) map to ONE closest partner in the
+# OTHER domain's OVERLAP user pool (ids < n_shared). Self-match is allowed
+# (overlap users typically pick themselves -> their own real cross-domain
+# history). Each batch step does a STANDARD 1-positive in-batch InfoNCE:
+# anchor = s_self[u]; positive = one random training item of u's partner
+# in the other domain; negatives = the other anchors' partner items in
+# the same batch (anchors sharing a partner are masked as false negatives).
+# Reuses ``align_temp`` for the temperature.
+pseudo_overlap_weight: 0
+pseudo_overlap_refresh_every: 3
+
+# User-user InfoNCE on the domain-shared vectors (s1, s2). OVERLAP-ONLY anchors.
+#
+# Anchors: overlap users (``u < n_shared``) that appear in this batch.
+#   They are the only users with a well-defined cross-domain identity.
+# Positive: ``s_other[u]`` -- same overlap user's shared vector in the
+#   OTHER domain.
+# Candidate pool: all OTHER-domain overlap users + OTHER-domain users in
+#   the current batch, deduplicated. Standard N-way InfoNCE: the positive
+#   is included once in the denominator. Non-overlap users are excluded as
+#   anchors, but OTHER-domain non-overlap batch users can be negatives.
+#
+# Logits use cosine similarity / ``align_temp``; the loss is symmetric
+# across d1 <-> d2.
+shared_user_nce_weight: 0
+
+# Distribution-level (MMD) alignment between batch users' shared vectors
+# across the two domains. Complementary to ``shared_user_nce_weight``:
+#   - Per-user InfoNCE only acts on OVERLAP anchors and requires identity
+#     correspondence. It cannot help non-overlap users.
+#   - MMD acts on ALL batch users (overlap + non-overlap) and aligns the
+#     whole shared-cloud DISTRIBUTION in feature space, not just paired
+#     identities. No correspondence needed.
+#
+# Implementation: multi-bandwidth RBF (sigmas = 0.5/1/2/4/8) over
+# L2-normalised batch shared vectors. Skipped on batches where either
+# side has fewer than 4 unique users (high-variance estimate).
+#
+# Weight mode:
+#   - If shared_user_mmd_weight != 0, both directions use this same value.
+#   - If shared_user_mmd_weight == 0, use the domain-specific directional
+#     weights below: A updates domain_1, B updates domain_2. The opposite
+#     domain is detached in each directional loss.
+shared_user_mmd_weight: 7
+shared_user_mmd_weight_A: 0
+shared_user_mmd_weight_B: 0
+
+# Paired overlap-user cosine alignment on the shared vectors:
+#   loss = 1 - cos(s1[u], s2[u]) for overlap users appearing in either
+#   domain's current batch. Unlike shared_user_nce, this only pulls the
+#   same identity together and does not introduce user negatives.
+shared_overlap_cos_weight: 0
+
+# Shared-channel ranking distillation: the final fused user vector is the
+# detached teacher, and the shared vector learns its pos-vs-neg margin
+# with MSE. Item vectors are detached in this loss so the auxiliary signal
+# mainly trains ``s``.
+shared_distill_weight: 0
+
+# Original standalone shared-channel BPR. Directly asks ``s1`` / ``s2`` to
+# rank each domain's own positive item above its sampled negative item.
+# This is independent from ``shared_distill_weight`` and can be ablated
+# separately.
+shared_bpr_weight: 0
+
+# Shared-channel cross-domain BPR. One symmetric weight controls both
+# source-domain shared branches:
+#   - d1/s1 in-domain shared BPR + s1 -> d2 overlap cross BPR.
+#   - d2/s2 in-domain shared BPR + s2 -> d1 overlap cross BPR.
+# Keep ``shared_bpr_weight`` at 0 to avoid double-counting in-domain BPR.
+shared_cross_bpr_weight: 3
+
+# RQ-VAE item code generation
+# rqvae_codebook_sizes: [n_tag1, n_tag2]
+# Codebook sharing pattern:
+#   private_shared : domain-specific Tag1, shared Tag2 (P->S baseline)
+#   shared_shared  : shared Tag1 and shared Tag2 (S->S ablation)
+rqvae_codebook_sharing: private_shared
+# Downstream U-Tag and I-Tag graphs keep independent role-specific parameters;
+# cross-domain Tag1 sharing follows the selected pattern and Tag2 stays shared.
+rqvae_codebook_sizes: [32, 32]
+rqvae_beta: 0.25
+rqvae_latent_dim: 128
+rqvae_tag2_align_temp: 0.2
+# JS divergence between overlap users' per-domain Tag2-interest distributions.
+rqvae_user_tag2_js_weight: 0.05
+rqvae_user_tag2_js_batch_size: 64
+
+# CrossAug: shared/specific split + augmentation + Householder
+shared_dim: 64
+n_layers: 2
+cbatch_size: 512
+l_alpha: 0.9
+cd_alpha: 0.5
+ll: 2.0
+cdl: 0
+al: 0.5
+n_hh: 16
+
+# DisenCDR: disentangled cross-domain recommendation
+disen_feature_dim: 128
+disen_hidden_dim: 128
+disen_gnn_layers: 2
+disen_dropout: 0.3
+disen_leakey: 0.1
+disen_beta: 0.9
+disen_rate: 0.5
+disen_warmup_epochs: 10
+disen_kld_weight: 0.25
+
+# MFGSLAE: multi-factor graph-structure-learning autoencoder
+mfgslae_lat_dim: 64
+mfgslae_dropout: 0.7
+mfgslae_tau: 0.5
+mfgslae_factor: 4
+mfgslae_epsilon: 5.0
+mfgslae_alpha: 0.1
+mfgslae_ratio: 0.99
+mfgslae_ratio_threshold: 0.5
+mfgslae_l1_rate: 1.0e-6
+mfgslae_nb_random_features: 64
+# Optimizer weight_decay (used by Adam). Original MF-GSLAE config = 0.01.
+# Set to 0 if running other models; switch to 0.01 (or tune) when running MFGSLAE.
+weight_decay: 0
+
+# VUG: BiTGCF backbone + cross-domain dual-attention source generator
+vug_n_layers: 2
+vug_lambda_source: 0.5
+vug_lambda_target: 0.5
+vug_drop_rate: 0.1
+vug_connect_way: mean        # 'mean' or 'concat'
+vug_is_transfer: true
+vug_enhance_mode: add        # 'add' / 'asrealsource' / 'none'
+vug_enhance_weight: 0.5
+vug_user_weight_attn: 0.9    # alpha mixing user-/item-level attention weights
+vug_gen_weight: 0.9          # MSE vs uniformity trade-off inside generator loss
+vug_gen_loss_weight: 1.0     # outer weight for the generator loss
+vug_reg_weight: 0.0001
+
+# BiTGCF: bidirectional transfer graph collaborative filtering
+bitgcf_embedding_size: 64
+bitgcf_n_layers: 2
+bitgcf_reg_weight: 0.001
+bitgcf_lambda_source: 0.8
+bitgcf_lambda_target: 0.8
+bitgcf_connect_way: concat
+bitgcf_drop_rate: 0.3
+bitgcf_is_transfer: true
+
+# CoNet: collaborative cross networks; adapted from VUG00 CoNet defaults
+conet_embedding_size: 64
+conet_mlp_hidden_size: [64, 32]
+conet_reg_weight: 0.01
+conet_is_transfer: true
+conet_eval_user_chunk_size: 64
+conet_eval_item_chunk_size: 2048
+
+# CDFA: BCE-MF backbone + cross-domain MLP enhancement + Δ-style fairness regularizer
+cdfa_alpha: 0.1                      # source vs target loss balance (alpha*src + (1-alpha)*tgt)
+cdfa_lambda: 0.1                     # source-domain L2 reg weight
+cdfa_gamma: 0.1                      # target-domain L2 reg weight
+cdfa_nn_hidden: 128                  # cross-domain MLP hidden size (defaults to embedding_size)
+cdfa_nn_dropout: 0.2
+cdfa_nn_layers: 3
+cdfa_nn_weight: 1.0e-5               # weight on the cross-domain MLP MSE reg term
+cdfa_fairness_method: wasserstein    # 'mean_diff' / 'kl_div' / 'wasserstein' / 'moment_matching'
+cdfa_fairness_weight: 0.05
+
+# AHNCDR: heterogeneous cross-domain network with multi-stage GNN + proto-NCE
+ahncdr_seq_len: 20
+ahncdr_hid_dim: 32
+ahncdr_m1_layers: 2
+ahncdr_m3_layers: 3
+ahncdr_alpha_l: 3
+ahncdr_proto_reg: 1.0e-3
+ahncdr_dbscan_eps: 7.9
+ahncdr_dbscan_min_samples: 10
+
+# FedPCL-CDR: federated prototype contrastive CDR with LDP K-means
+fedpcl_n_layers: 3
+fedpcl_num_clusters: 10
+fedpcl_tau: 0.2
+fedpcl_alpha: 0.01
+fedpcl_lap_noise: 0.1
+fedpcl_clip_C: 0.2
+fedpcl_reg_weight: 0.0001
+
+# CDCDR: conditional-diffusion CDR (DreamRec-style); adapted to bidirectional CDR
+cdcdr_history_len: 10
+cdcdr_aggregator: transformer    # 'mean' / 'user_attention' / 'self_attention' / 'transformer'
+cdcdr_gamma: 0.999               # mix between user embedding and aggregated history (large -> user-heavy)
+cdcdr_n_heads: 4                 # only used by 'transformer' aggregator
+cdcdr_n_layers: 1                # transformer encoder depth (CDCDR-specific; distinct from other models)
+cdcdr_dropout: 0.1
+cdcdr_layer_norm: true
+cdcdr_mean_pooling: false        # transformer aggregator: true -> mean-pool, false -> last-valid token
+cdcdr_loss_n: bpr                # 'bce' / 'bpr' / 'mse'
+cdcdr_diffuser_type: mlp1        # 'mlp1' / 'mlp2'
+cdcdr_timesteps: 2000            # diffusion training steps
+cdcdr_linespace: 100             # DDIM stride (sub_timesteps = timesteps/linespace + 1)
+cdcdr_uncon_w: 5.0               # classifier-free guidance weight at inference
+cdcdr_uncon_p: 0.1               # probability of dropping the condition during training
+cdcdr_beta_sche: linear          # 'linear' / 'exp' / 'cosine' / 'sqrt'
+cdcdr_loss_balance: 0.5          # balance(d1, d2) = loss_balance*d1 + (1-loss_balance)*d2
+cdcdr_diffusion_weight: 1.0      # weight of the diffusion MSE loss term
+
+# DiffCDR: DiffCDR00 entry.py --exp_part diff_CDR adapted to Copenhagen ranking
+diffcdr_emb_dim: 10
+diffcdr_pretrain_epochs: 50
+diffcdr_diff_lr: 0.001
+diffcdr_wd: 0
+diffcdr_reg_weight: 0
+diffcdr_steps: 1000
+diffcdr_scale: 0.1
+diffcdr_dim: 128
+diffcdr_sample_steps: 30
+diffcdr_task_lambda: 0.1
+diffcdr_mask_rate: 0.1
+diffcdr_clip_norm: 1.0
+
+# D2TCDR: domain-decomposition + transferable conditional-diffusion CDR (sequential)
+d2tcdr_max_len: 8                # per-user history length fed into the Transformer
+d2tcdr_num_blocks: 4             # # of Transformer blocks inside the diffusion denoiser
+d2tcdr_n_heads: 4                # # of attention heads
+d2tcdr_dropout: 0.1              # Transformer / attention dropout
+d2tcdr_emb_dropout: 0.3          # embedding dropout before LayerNorm
+d2tcdr_diffusion_steps: 32       # # of diffusion timesteps (T)
+d2tcdr_noise_schedule: trunc_lin # 'linear'/'cosine'/'sqrt'/'trunc_cos'/'trunc_lin'
+d2tcdr_w: 1.0                    # CFG-style weight at inference (item branch vs shared branch)
+d2tcdr_lambda_uncertainty: 0.001 # noise scale for the uncertainty injection
+d2tcdr_rescale_timesteps: true   # rescale t to [0, 1000) before time embedding
+d2tcdr_loss_lambda: 1.0          # weight on the cross-domain decomposition loss
+d2tcdr_lambda_shared: 200.0      # MMD weight pulling d1/d2 SHARED parts together
+d2tcdr_lambda_private: 0.2       # 1/MMD weight pushing d1/d2 PRIVATE parts apart
+d2tcdr_lambda_orthogonal: 20.0   # cosine^2 weight enforcing shared ⊥ private
+
+# LLMCDSR: LLM4CDSR sequence model adapted to Copenhagen splits
+llmcdsr_hidden_size: 128
+llmcdsr_trm_num: 2
+llmcdsr_num_heads: 1
+llmcdsr_dropout_rate: 0.5
+llmcdsr_max_len: 200
+llmcdsr_local_emb: true
+llmcdsr_global_emb: true
+llmcdsr_freeze_emb: true
+llmcdsr_alpha: 0.1
+llmcdsr_beta: 0.1
+llmcdsr_tau: 1.0
+llmcdsr_tau_reg: 1.0
