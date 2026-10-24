@@ -29,51 +29,6 @@ def _grad_reverse(x, lambd=1.0):
 
 
 class TagGraph(nn.Module):
-    """Hierarchical Tag LightGCN subgraph (anchors are users or items).
-
-    Node ordering: ``[anchors (n_anchors) | tag1 (n_tag1) | tag2 (n_tag2)]``.
-
-    Three topologies are supported, selected by ``topology``:
-
-    ``chain`` (legacy)
-        ``anchor - Tag1 - Tag2``. Tag2 sits two hops from the anchors.
-    ``parallel``
-        ``anchor - Tag1`` and ``anchor - Tag2`` as two independent one-hop
-        channels; the Tag1-Tag2 edges are dropped from propagation.
-    ``swapped``
-        ``anchor - Tag2 - Tag1``. This swaps the two tag levels used by graph
-        propagation: shared Tag2 is one hop from the anchors and domain-specific
-        Tag1 is two hops away. The RQ-VAE codes and embeddings are not relabelled.
-
-    The parallel topology exists because Tag1 and Tag2 are nearly independent
-    (normalised MI ~0.02-0.05), which makes the Tag1-Tag2 bipartite graph
-    almost complete. Routing Tag2 through it washes the per-anchor Tag2
-    signal out to a near-constant vector (measured: 96% of each user's Tag2
-    message is the global mean, and the per-user Tag2 distribution sits only
-    0.13 total-variation away from the population average versus 0.83 for the
-    direct edges). Chaining also leaks that constant back into the Tag1
-    channel, so the two levels are kept on separate one-hop paths instead.
-
-    Edges:
-      - Anchor-Tag1 (``A-Tag1``): per (anchor, tag1) pair. Edge weight =
-        ``sigmoid(logit)`` with one learnable logit per pair. When
-        ``freq_init=True`` the logit is initialised as
-        ``base + gamma * freq_score(a, t)`` (``freq_score`` = log1p of the
-        (a, t) interaction count, divided by its max so it lives in
-        ``[0, 1]``). When ``freq_init=False`` every edge logit is
-        initialised to the constant ``base`` (used for the I-Tag1 graph).
-      - Anchor-Tag2 (``A-Tag2``, ``parallel``/``swapped``): same gated form,
-        per (anchor, tag2) pair.
-      - Tag1-Tag2 (``chain``/``swapped``): one undirected edge per item,
-        mapping the item's first-level code to its second-level code. Weight is
-        fixed to 1.
-
-    Tag1 (per-domain mid-tag) and Tag2 (outer-tag) embeddings are owned by
-    the parent module and passed in at :meth:`propagate` time, so U-Tag and
-    I-Tag graphs can keep independent tag parameters while reusing the same
-    graph kernel. Symmetric LightGCN normalisation uses the binary degree of
-    each node (counting multiplicities for repeated Tag1-Tag2 edges).
-    """
 
     @staticmethod
     def _gate_logits_init(n_edges, freqs, base, gamma, freq_init):
@@ -151,9 +106,6 @@ class TagGraph(nn.Module):
         self.register_buffer("at1_edges", at1_edges.clone(), persistent=False)
         at_row, at_col, at_eidx = self._undirected(at1_edges, n_at, 0, n_anchors)
 
-        # --- Anchor-Tag2 learnable gates (parallel/swapped topologies) ---
-        # Tag2 is the cross-domain bridge, so a direct one-hop edge keeps each
-        # anchor's own Tag2 profile instead of the Tag1-averaged version.
         if topology in ("parallel", "swapped"):
             at2_edges = at2_edges.long()
             n_at2 = int(at2_edges.shape[0])
@@ -180,7 +132,6 @@ class TagGraph(nn.Module):
         self.register_buffer("at2_edges", at2_edges.clone(), persistent=False)
         self.n_at2 = n_at2
 
-        # --- Tag1-Tag2 edges (one per item, weight 1; chain topologies only) ---
         if topology in ("chain", "swapped"):
             t1_node = t1t2_edges[:, 0].long() + n_anchors
             t2_node = t1t2_edges[:, 1].long() + n_anchors + n_tag1
@@ -190,17 +141,11 @@ class TagGraph(nn.Module):
             t_row = torch.zeros(0, dtype=torch.long)
             t_col = torch.zeros(0, dtype=torch.long)
 
-        # --- Static (fixed-weight) degree contribution from Tag1-Tag2 edges ---
-        # Weighted LightGCN: deg_i = sum_j w_ij. Tag1-Tag2 edges have w=1 and
-        # are fixed, so their contribution can be cached; the A-Tag1 part
-        # (w_ij = sigmoid(logit)) is recomputed each forward from the current
-        # gates so that normalisation always matches the learnable edge weights.
+
         deg_static = torch.zeros(self.n_total, dtype=torch.float32)
         deg_static.scatter_add_(0, t_row, torch.ones_like(t_row, dtype=torch.float32))
 
-        # Raw (tag1, tag2) pairs without node offsets, used by downstream
-        # consumers that need to map Tag1 ids onto Tag2 ids (e.g. computing
-        # per-user Tag2 distributions).
+
         self.register_buffer(
             "t1t2_raw", t1t2_edges.long().clone(), persistent=False,
         )
@@ -224,11 +169,7 @@ class TagGraph(nn.Module):
         self.n_at = n_at
 
     def _edge_values(self):
-        """Weighted symmetric normalisation shared by all propagation modes.
 
-        ``deg_i = sum_j w_ij`` is recomputed from the current gates so the
-        normaliser follows the learnable edge weights (weighted LightGCN).
-        """
         deg = self.deg_static.clone()
         gates = gates2 = None
         if self.n_at:
@@ -272,20 +213,7 @@ class TagGraph(nn.Module):
 
     def propagate_decomposed(self, anchor_emb, tag1_emb, tag2_emb,
                              n_layers, dropout):
-        """Propagate and return the three additive source contributions.
 
-        Propagation is linear in the node features, so seeding three disjoint
-        feature blocks with one source each and running a single pass yields
-        the exact per-source decomposition of the anchor output:
-
-            ``propagate(...) == base + tag1_path + tag2_path``
-
-        (exact in eval mode; in train mode the dropout masks differ per block,
-        which is distributionally equivalent.) This lets the caller route the
-        Tag2 contribution -- the cross-domain bridge -- into the shared user
-        branch, so the shared-branch losses backpropagate through Tag2 instead
-        of bypassing it.
-        """
         d = anchor_emb.shape[1]
         zeros_a = anchor_emb.new_zeros(self.n_anchors, d)
         zeros_1 = tag1_emb.new_zeros(self.n_tag1, d)
@@ -301,14 +229,7 @@ class TagGraph(nn.Module):
         return agg[:, :d], agg[:, d:2 * d], agg[:, 2 * d:]
 
     def sparsity_loss(self):
-        """Weighted mean of sigmoid gates — drives Anchor-Tag edges toward sparsity.
 
-        Each edge's sigmoid gate is multiplied by its (non-trainable)
-        ``at*_sparsity_weights`` entry before averaging. When the buffers are
-        left at their default (all ones) this reduces to a plain mean. In the
-        ``parallel`` and ``swapped`` topologies the Anchor-Tag2 gates are
-        averaged in as well.
-        """
         terms = []
         if self.n_at:
             terms.append(
@@ -336,10 +257,7 @@ class STPD(nn.Module):
         self.emb_dim = params["embedding_size"]
         self.drop_rate = params["drop_rate"]
         self.intra_domain_layers = params["intra_domain_layers"]
-        # U-I LightGCN depth is decoupled from the Tag-graph depth so the two
-        # propagation stages can be tuned independently. Falls back to
-        # ``intra_domain_layers`` when ``ui_graph_layers`` is absent from the
-        # config (preserves legacy behaviour).
+
         self.ui_graph_layers = int(
             params.get("ui_graph_layers", self.intra_domain_layers)
         )
@@ -350,17 +268,12 @@ class STPD(nn.Module):
         self.d2_domain_name = args.d2.get("name", "domain2").lower()
         self.n_users = self.d1_n_users + self.d2_n_users - self.n_shared_users
 
-        # Raw U-I LightGCN inputs used when tag graphs are unavailable, and
-        # by the ``wocross`` ablation. In the normal STPD tag path, the
-        # U-I graph receives the U/I-Tag graph outputs instead.
         self.d1_user = nn.Embedding(self.n_users, self.emb_dim, dtype=self.dtype)
         self.d1_item = nn.Embedding(self.d1_n_items, self.emb_dim, dtype=self.dtype)
         self.d2_user = nn.Embedding(self.n_users, self.emb_dim, dtype=self.dtype)
         self.d2_item = nn.Embedding(self.d2_n_items, self.emb_dim, dtype=self.dtype)
 
-        # Dedicated U / I inputs for the U-Tag and I-Tag graphs. The I-Tag item
-        # tables are initialised from the offline PCA-reduced content vectors
-        # after the generic module initialisation below, then trained normally.
+
         self.d1_user_tg = nn.Embedding(self.n_users, self.emb_dim, dtype=self.dtype)
         self.d2_user_tg = nn.Embedding(self.n_users, self.emb_dim, dtype=self.dtype)
         self.d1_item_tg = nn.Embedding(
@@ -409,38 +322,22 @@ class STPD(nn.Module):
         self.d1_graph = self._build_norm_graph(args.d1["inter_mat"])
         self.d2_graph = self._build_norm_graph(args.d2["inter_mat"])
 
-        # CSR-style per-overlap-user positive-item lookup, used by the
-        # cross-domain InfoNCE alignment loss so that an overlap user only
-        # needs to appear in ONE domain's batch — we sample their positive
-        # item in the OTHER domain from this training-set cache instead of
-        # requiring the same user to also be present in the other domain's
-        # batch (critical in the sparse-overlap setting).
         self._build_overlap_pos_lookup(args)
 
-        # All-user CSR pos-item lookup (every user, not just overlap), used
-        # by the pseudo-overlap multi-positive InfoNCE so we can fetch the
-        # full training-set positives of an arbitrary partner user in the
-        # other domain (the partner can be overlap, d1-only, or d2-only).
+
         self._build_all_pos_lookup(args)
 
         # Unified xavier initialization for all trainable modules.
         self.apply(self._init_weights)
 
-        # Replace the random I-Tag item-table rows with their offline PCA
-        # content embeddings. This must happen after ``self.apply`` so the
-        # generic Xavier pass does not overwrite the PCA values.
+
         self._maybe_load_pca_item_init(args)
 
-        # Match teacher pre-training initialisation: items use xavier_uniform_
-        # with gain=1 (see pretrain_teacher.py); users use xavier_normal_ which
-        # is already applied by _init_weights above.
+
         nn.init.xavier_uniform_(self.d1_item.weight, gain=1)
         nn.init.xavier_uniform_(self.d2_item.weight, gain=1)
 
-        # Ablation: freeze PCA content as the I-Tag anchor and learn only a
-        # 128x128 projection, so no per-item free parameter exists and the
-        # Tag graph's cross-item smoothing becomes a real constraint that
-        # cannot be row-wise absorbed by the anchor table.
+
         self.item_anchor_mode = str(
             args.params.get("item_anchor_mode", "free")
         ).strip().lower()
@@ -471,11 +368,7 @@ class STPD(nn.Module):
                 f"{self.item_anchor_mode!r}."
             )
 
-        # How the private/shared user split is produced. In `tag2` mode the
-        # shared branch IS the Tag2 contribution of the Tag graph, so the
-        # heavily weighted shared-branch losses (shared_cross_bpr, shared MMD)
-        # backpropagate through the shared Tag2 bridge rather than through a
-        # free gated vector that bypasses every Tag parameter.
+
         self.shared_split_mode = str(
             args.params.get("shared_split_mode", "gate")
         ).strip().lower()
@@ -485,9 +378,7 @@ class STPD(nn.Module):
                 f"{self.shared_split_mode!r}."
             )
         if self.shared_split_mode == "tag2" and not self.use_tag_outputs_as_ui_input:
-            # The wocross ablation bypasses the Tag path entirely, so there is
-            # no Tag2 channel to derive the shared branch from. Fall back to
-            # the gate split so the STPD/wocross pair can share one config.
+
             print(
                 "Info: shared_split_mode=tag2 has no Tag2 channel when the Tag "
                 "path is bypassed; falling back to the gate split."
@@ -500,9 +391,7 @@ class STPD(nn.Module):
                 "through the shared Tag2 bridge."
             )
 
-        # Tag-graph topology. `chain` is the legacy anchor-Tag1-Tag2 cascade;
-        # `parallel` makes Tag1/Tag2 independent one-hop channels; `swapped`
-        # reverses the cascade to anchor-Tag2-Tag1 for a controlled ablation.
+
         self.tag_graph_topology = str(
             args.params.get("tag_graph_topology", "chain")
         ).strip().lower()
@@ -522,26 +411,17 @@ class STPD(nn.Module):
                 "Anchor-Tag2-Tag1 (Tag2 one hop, Tag1 two hops)."
             )
 
-        # Keep fallback/wocross U-I embeddings random at initialisation:
-        # users from _init_weights, items from the xavier_uniform_ calls above.
 
-        # Neutral init for gate and fusion: g ~= 0.5 and alpha ~= 0.5 so that
-        # private / shared start at equal magnitude and contribute equally to
-        # the fused user, giving the cross-domain branch a visible signal
-        # from step 0 instead of starting in a private-dominant regime.
         nn.init.constant_(self.gate_d1[-1].bias, 0.0)
         nn.init.constant_(self.gate_d2[-1].bias, 0.0)
         nn.init.constant_(self.fuse_d1[-1].bias, 0.0)
         nn.init.constant_(self.fuse_d2[-1].bias, 0.0)
 
-        # Build per-domain U-Tag and I-Tag graphs from the RQ-VAE codes and
-        # codebooks. U-Tag and I-Tag keep independent Tag parameters.
+
         self.has_tag_graphs = False
         self._build_tag_graphs(args)
 
-        # Optionally transfer the teacher's learned Tag-branch anchor
-        # embeddings and U-Tag1 / I-Tag1 edge gates. Tag embeddings remain
-        # RQ-VAE initialised.
+
         self._maybe_load_teacher_init(args)
 
         self.reg_weight = params.get("reg_weight", 0.001)
@@ -558,47 +438,20 @@ class STPD(nn.Module):
         )
         self.domain_grl_lambda = float(params.get("domain_grl_lambda", 1.0) or 1.0)
 
-        # Lna: in-batch contrastive loss on domain-private user vectors.
-        # For each (user, pos_item) in the batch, push the score between the
-        # user's domain-private vector and its positive item away from the
-        # scores against every other in-batch positive item.
+
         self.lna_weight = params.get("lna_weight", 0.0)
         self.lna_temp = params.get("lna_temp", 0.2)
 
-        # Pseudo-overlap alignment via Tag2 profile similarity.
-        # Every user u (overlap and non-overlap) is mapped to ONE closest
-        # partner v in the other domain's OVERLAP user pool (ids in
-        # ``[0, n_shared)``), by argmax of cosine similarity between their
-        # Tag2 preference distributions (Tag2 is the cross-domain shared
-        # vocabulary, so distributions are directly comparable). Self-match
-        # is allowed: if u is
-        # itself an overlap user, its closest is typically u in the other
-        # domain, so the partner-derived positive is just u's own real
-        # cross-domain history.
-        # The loss is a STANDARD 1-positive InfoNCE on the shared branch:
-        # for each batch anchor we draw one random training positive from
-        # its partner's other-domain history; in-batch logits form a
-        # [B, B] matrix where the diagonal is the positive and off-diagonal
-        # entries are negatives (other anchors' partner items). Anchors
-        # sharing the same partner are masked out as false negatives.
-        # Reuses ``align_temp`` for the temperature.
+
         self.pseudo_overlap_weight = params.get("pseudo_overlap_weight", 0.0)
         self.pseudo_overlap_refresh_every = int(
             params.get("pseudo_overlap_refresh_every", 3)
         )
 
-        # User-user InfoNCE on the domain-shared vectors. OVERLAP-ONLY anchors.
-        # Anchors are overlap users (``u < n_shared``) appearing in the
-        # current batch; positive = ``s_other[u]`` (same id in the other
-        # domain); candidate pool = all OTHER-domain overlap users plus
-        # OTHER-domain batch users. Symmetric across d1/d2; reuses
-        # ``align_temp``.
+
         self.shared_user_nce_weight = params.get("shared_user_nce_weight", 0.0)
 
-        # Directional distribution-level (MMD) alignment between batch
-        # users' shared vectors across the two domains. If the legacy
-        # symmetric knob is non-zero, both directions use that value;
-        # otherwise domain-specific A/B weights are used.
+
         self.shared_user_mmd_weight = float(
             params.get("shared_user_mmd_weight", 0.0) or 0.0
         )
@@ -613,23 +466,15 @@ class STPD(nn.Module):
                 params.get("shared_user_mmd_weight_B", 0.0) or 0.0
             )
 
-        # Paired overlap-user cosine alignment: only pulls s1[u] and s2[u]
-        # together for the same overlap identity, with no contrastive
-        # negatives.
+
         self.shared_overlap_cos_weight = params.get("shared_overlap_cos_weight", 0.0)
 
-        # Shared-channel ranking distillation: the shared vector learns the
-        # final fused user's pos-vs-neg margin, but the teacher margin and
-        # item vectors are detached so this mainly trains the shared user
-        # channel.
+
         self.shared_distill_weight = params.get("shared_distill_weight", 0.0)
 
-        # Original standalone shared-channel BPR. This directly asks s1/s2
-        # to rank each domain's own positive above its sampled negative.
+
         self.shared_bpr_weight = params.get("shared_bpr_weight", 0.0)
 
-        # Shared-channel cross-domain BPR, controlled by one symmetric
-        # weight for both source-domain shared branches.
         self.shared_cross_bpr_weight = params.get("shared_cross_bpr_weight", 0.0)
 
         # Epoch tracker compatible with main.py (`args.model._epoch[0] = i`).
@@ -638,13 +483,7 @@ class STPD(nn.Module):
         )
         self._last_pseudo_refresh = -1
 
-        # Cached closest-overlap-partner lookup (refilled every
-        # ``pseudo_overlap_refresh_every`` epochs inside ``calculate_loss``).
-        # ``_d1_partner_overlap[u]`` is the local-d2 overlap-user id (i.e.
-        # in ``[0, n_shared)``) closest to local-d1 user u; symmetric for
-        # ``_d2_partner_overlap``. ``_*_partner_valid[u]`` is True iff that
-        # partner has a non-empty other-domain training history (so a
-        # positive can be sampled).
+
         self.register_buffer(
             "_d1_partner_overlap", torch.zeros(0, dtype=torch.long), persistent=False,
         )
@@ -728,12 +567,7 @@ class STPD(nn.Module):
         return x
 
     def _item_tg_weight(self, domain):
-        """Return the full [n_items, emb_dim] I-Tag anchor tensor.
 
-        In ``free`` mode this is the trainable ``d{1,2}_item_tg.weight``.
-        In ``content_proj`` mode the frozen PCA content is projected through
-        a learnable 128x128 matrix, so no per-item free parameter exists.
-        """
         if self.item_anchor_mode == "content_proj":
             proj = self.d1_item_proj if domain == 1 else self.d2_item_proj
             table = self.d1_item_tg if domain == 1 else self.d2_item_tg
@@ -757,14 +591,7 @@ class STPD(nn.Module):
         return self.d1_i_tag1_emb if domain == 1 else self.d2_i_tag1_emb
 
     def _collect_user_tag1_edges(self, train_inters, codes, domain, code_col=0):
-        """Return ``(edges, freqs)`` for U-Tag in this domain.
 
-        ``edges`` is ``[E, 2]`` of unique ``(global_user, tag_id)`` pairs;
-        ``freqs`` is ``[E]`` interaction counts. ``code_col`` selects the RQ
-        level: ``0`` for the per-domain Tag1, ``1`` for the shared Tag2 (used
-        by the ``parallel``/``swapped`` direct U-Tag2 edges). Domain-2
-        non-shared users are remapped to the global id space.
-        """
         shift = self.d1_n_users - self.n_shared_users
         pairs = {}
         for inter in train_inters:
@@ -793,13 +620,7 @@ class STPD(nn.Module):
 
     def _build_user_tag2_profile(self, train_inters, codes, domain, n_tag2,
                                  item_tag2_soft=None):
-        """Per-global-user Tag2 interest profile from interacted items.
 
-        This mirrors the RQ-VAE overlap-user alignment objective: a user's
-        Tag2 distribution is the average Tag2 assignment of its interacted
-        items.  New RQ-VAE artifacts save soft item->Tag2 assignments; older
-        artifacts only have hard RQ codes, so they fall back to one-hot counts.
-        """
         shift = self.d1_n_users - self.n_shared_users
         profile = torch.zeros(self.n_users, n_tag2, dtype=torch.float32)
         if item_tag2_soft is not None:
@@ -820,13 +641,7 @@ class STPD(nn.Module):
         return profile / profile.sum(dim=1, keepdim=True).clamp(min=1e-8)
 
     def _build_tag_graphs(self, args):
-        """Load RQ-VAE artifacts and build per-domain U-Tag and I-Tag graphs.
 
-        U-Tag and I-Tag graphs keep independent role parameters. Cross-domain
-        Tag1 sharing follows the RQ-VAE artifact; Tag2 is always shared.
-        Each graph has learnable gates on whichever tag level is directly
-        attached to its anchors (Tag1 normally, Tag2 for ``swapped``).
-        """
         rq_path = os.path.join(args.material_path, "rqvae_codes.pt")
         if not os.path.isfile(rq_path):
             print(
@@ -862,10 +677,7 @@ class STPD(nn.Module):
         d1_item_tag2_soft = rq.get("d1_item_tag2_soft")
         d2_item_tag2_soft = rq.get("d2_item_tag2_soft")
 
-        # Ablation: shuffle item->code assignments per domain. Row permutation
-        # preserves cluster sizes, the Tag1-Tag2 edge multiset, and the shared
-        # Tag2 semantics (code k means the same in both domains), but breaks
-        # the semantic connection between item identity and its cluster.
+
         tag_codes_mode = str(
             args.params.get("tag_codes", "none")
         ).strip().lower()
@@ -893,10 +705,7 @@ class STPD(nn.Module):
                     "Tag1 codebooks. Rerun rqvae.py."
                 )
 
-        # Role-specific Tag embeddings. The RQ codes always define graph
-        # topology; this option only ablates the codebook-vector initialisation.
-        # U-Tag and I-Tag start from identical values, as in the RQ-VAE path,
-        # but remain independent trainable parameters afterwards.
+
         tag_embedding_init = str(
             args.params.get("tag_embedding_init", "rqvae")
         ).strip().lower()
@@ -959,10 +768,7 @@ class STPD(nn.Module):
             [torch.arange(self.d2_n_items, dtype=torch.long), d2_codes[:, 0]], dim=1,
         )
 
-        # Direct Anchor-Tag2 edges for the ``parallel`` and ``swapped``
-        # topologies. In ``swapped`` these replace the direct Anchor-Tag1 edges.
-        # Items map to their own 2nd-level code; users accumulate the Tag2
-        # codes of the items they interacted with, weighted by frequency.
+
         if self.tag_graph_topology in ("parallel", "swapped"):
             d1_ut2_edges, d1_ut2_freqs = self._collect_user_tag1_edges(
                 args.d1["train"], d1_codes, domain=1, code_col=1,
@@ -1087,13 +893,7 @@ class STPD(nn.Module):
         )
 
     def _maybe_load_teacher_init(self, args):
-        """Copy teacher Tag-branch anchor embeddings and edge gates.
 
-        Teacher U/I embeddings are loaded only into ``d{1,2}_{user,item}_tg``
-        so the U/I-Tag branch starts from the pre-trained Tag graph and then
-        feeds the U-I LightGCN. Role-specific Tag1/Tag2 parameters stay at
-        their RQ-VAE codebook initialisation.
-        """
         if not args.params.get("use_teacher_pretrain", False):
             print("Info: teacher_pretrain transfer disabled; "
                   "keeping non-teacher initialisation.")
@@ -1111,9 +911,7 @@ class STPD(nn.Module):
             return
         loaded = []
         with torch.no_grad():
-            # ---- Tag-branch anchor embeddings ----
-            # In content_proj mode the I-Tag item table is frozen PCA content;
-            # skip teacher transfer for it so the content anchor is preserved.
+
             item_pairs = []
             if self.item_anchor_mode != "content_proj":
                 item_pairs = [
@@ -1158,21 +956,7 @@ class STPD(nn.Module):
         return convert_sp_mat_to_sp_tensor(norm, dtype=self.dtype).to(self.device)
 
     def _build_overlap_pos_lookup(self, args):
-        """Build CSR ``(offsets, items)`` of training positives per overlap user.
 
-        For each overlap user id ``u`` in ``[0, n_shared_users)`` we collect
-        the set of items they interacted with in d1 and d2 from
-        ``args.d1["train"]`` / ``args.d2["train"]``. Stored as registered
-        buffers so they follow the model to GPU and survive ``.cuda()``:
-
-        - ``_d1_ov_pos_offsets`` : LongTensor ``[n_shared_users + 1]``
-        - ``_d1_ov_pos_items``   : LongTensor ``[E1]`` (flat item ids)
-        - ``_d1_ov_has_pos``     : BoolTensor ``[n_shared_users]``
-        - same triple for d2
-
-        Sampling a random d1 positive for anchor users ``u`` is then a few
-        fully-vectorised ops on the GPU.
-        """
         def _build(train, n_shared, n_items):
             offsets = torch.zeros(n_shared + 1, dtype=torch.long)
             if n_shared == 0:
@@ -1215,13 +999,7 @@ class STPD(nn.Module):
         self.register_buffer("_d2_ov_pos_keys", d2_keys, persistent=False)
 
     def _build_all_pos_lookup(self, args):
-        """CSR ``(offsets, items)`` of training positives for EVERY user.
 
-        Same layout as :meth:`_build_overlap_pos_lookup`, but keyed by
-        local-domain user id over the FULL ``[0, dX_n_users)`` range. Used
-        by the pseudo-overlap multi-positive InfoNCE to fetch the full
-        positive list of an arbitrary partner user in the other domain.
-        """
         def _build(train, n_users_local):
             offsets = torch.zeros(n_users_local + 1, dtype=torch.long)
             if n_users_local == 0:
@@ -1251,20 +1029,7 @@ class STPD(nn.Module):
         self.register_buffer("_d2_all_has_pos", d2_has, persistent=False)
 
     def _gather_pos_items_all(self, users, domain):
-        """Gather full training-positive list per user (any user id).
 
-        Returns ``(items, mask, valid_anchor)``:
-
-        - ``items``         : LongTensor ``[A, max_count]``, item ids in
-          the target ``domain``. Padding cells are zero-filled.
-        - ``mask``          : BoolTensor ``[A, max_count]``, True where
-          ``items[i, j]`` is a real training positive of ``users[i]``.
-        - ``valid_anchor``  : BoolTensor ``[A]``, True iff the user has at
-          least one positive in this domain.
-
-        Reads the all-user lookup tables, so ``users`` may include d1-only
-        or d2-only ids in their respective local id spaces.
-        """
         if domain == 1:
             offsets, flat, has_pos = (
                 self._d1_all_pos_offsets, self._d1_all_pos_items, self._d1_all_has_pos,
@@ -1320,10 +1085,7 @@ class STPD(nn.Module):
     # ---- Forward ----
 
     def forward(self):
-        # Tag-graph stage: propagate anchor U / I embeddings through independent
-        # U-Tag1-Tag2-Tag1-U and I-Tag1-Tag2-Tag1-I subgraphs. U-Tag and
-        # I-Tag use separate role parameters; cross-domain sharing follows the
-        # selected RQ-VAE codebook pattern.
+
         split_on_tag2 = (
             self.shared_split_mode == "tag2" and self.has_tag_graphs
         )
@@ -1331,9 +1093,7 @@ class STPD(nn.Module):
         d1_item_t2 = d2_item_t2 = None
 
         if self.has_tag_graphs and split_on_tag2:
-            # Decomposed propagation: keep the Tag2 contribution separately so
-            # it can become the shared user branch. The three parts sum to the
-            # same output the non-decomposed path produces.
+
             d1_u_base, d1_u_t1, d1_user_t2 = self.d1_u_tag_graph.propagate_decomposed(
                 self.d1_user_tg.weight, self._user_tag1_embedding(1), self.u_tag2_emb,
                 self.intra_domain_layers, self.dropout,
@@ -1378,11 +1138,7 @@ class STPD(nn.Module):
             d1_item_tag = self.d1_item.weight
             d2_item_tag = self.d2_item.weight
 
-        # Per-domain U-I LightGCN now takes the U/I-Tag outputs as its input.
-        # If tag graphs are disabled, fall back to the raw U/I embeddings.
-        # ``aggregate`` is linear, so in tag2-split mode the Tag2 channel is
-        # pushed through the same graph alongside the full channel (batched on
-        # the feature axis) to recover the Tag2 component of the final output.
+
         d1_all = torch.cat([d1_user_tag, d1_item_tag])
         d2_all = torch.cat([d2_user_tag, d2_item_tag])
         if split_on_tag2:
@@ -1405,9 +1161,7 @@ class STPD(nn.Module):
 
         # Decompose user embeddings into domain-private and domain-shared.
         if split_on_tag2:
-            # Shared branch IS the Tag2 contribution, so shared_cross_bpr and
-            # the shared MMD backpropagate into the shared Tag2 bridge. The
-            # ``p + s == user_raw`` invariant of the gate path is preserved.
+
             s1, _ = self._split_domain_ui(d1_emb_t2, 1)
             s2, _ = self._split_domain_ui(d2_emb_t2, 2)
             p1 = d1_user_raw - s1
@@ -1430,22 +1184,7 @@ class STPD(nn.Module):
 
     def _xd_infonce_loss(self, s1, s2, inter_d1, inter_d2,
                          d1_item_emb, d2_item_emb):
-        """Overlap-only item InfoNCE on the shared branch.
 
-        Only overlap users (``u < n_shared``) in the current batch act as
-        anchors. For each anchor we build two standard 1-positive InfoNCE
-        terms:
-
-          - self-domain positive: the positive item carried by this training
-            sample, e.g. ``d1_item[i+]`` for a d1-side anchor.
-          - other-domain positive: one random training positive of the same
-            overlap user in the other domain.
-
-        The negative pool is the union of all positive items appearing in
-        both domains' current batch, following the in-batch style of Lna.
-        The anchor's own positive column is masked out of the negative pool
-        for its corresponding 1-positive term.
-        """
         if self.n_shared_users == 0:
             return torch.tensor(0.0, device=self.device)
 
@@ -1515,8 +1254,7 @@ class STPD(nn.Module):
         anchor_users = users_self[ov_mask]
         self_pos_items = items_self[ov_mask]
 
-        # Sample one cross-domain training positive per overlap user; drop
-        # anchors whose same user has empty other-domain history.
+
         other_pos_items, has_pos = self._sample_one_overlap_pos(
             anchor_users, other_domain,
         )
@@ -1595,25 +1333,7 @@ class STPD(nn.Module):
         return F.cross_entropy(discriminator(x), y)
 
     def _shared_user_nce_loss(self, s1, s2, inter_d1, inter_d2):
-        """User-user InfoNCE on the domain-shared vectors. OVERLAP-ONLY anchors.
 
-        Anchors are overlap users (``u < n_shared``) -- the only users
-        for whom a cross-domain positive ``s_other[u]`` is well-defined.
-        For each anchor ``u`` appearing in one domain's batch, the positive
-        remains ``s_other[u]`` while the candidate pool is the union of:
-
-          * all OTHER-domain overlap users ``s_other[:n_shared]``
-          * the OTHER-domain users appearing in the current batch
-
-        The positive is included once in the denominator and the label is
-        its column in this mixed candidate pool. Non-overlap users are never
-        anchors, but OTHER-domain non-overlap batch users can be negatives.
-
-        Symmetric across d1/d2; cosine similarity (L2-normalised);
-        reuses ``align_temp`` as the temperature. Returns 0 when no
-        overlap users exist or neither side has any overlap anchors in
-        the batch.
-        """
         if self.n_shared_users <= 0:
             return torch.tensor(0.0, device=self.device)
         if not (inter_d1.numel() or inter_d2.numel()):
@@ -1631,14 +1351,7 @@ class STPD(nn.Module):
         return sum(losses) / len(losses)
 
     def _shared_user_nce_one_side(self, batch_users, other_batch_users, s_self, s_other):
-        """One direction of :meth:`_shared_user_nce_loss`.
 
-        ``batch_users`` are local ids in ``s_self``'s domain. Anchors
-        are restricted to overlap users (``u < n_shared``) because only
-        they have a well-defined cross-domain positive ``s_other[u]``.
-        The candidate pool is all overlap users plus the other domain's
-        in-batch users, deduplicated in local id space.
-        """
         unique_users = torch.unique(batch_users)
         if unique_users.numel() == 0:
             return None
@@ -1660,28 +1373,7 @@ class STPD(nn.Module):
         return F.cross_entropy(logits, labels)
 
     def _shared_user_mmd_loss_terms(self, s1, s2, inter_d1, inter_d2):
-        """Directional MMD alignment between batch users' shared vectors.
 
-        Computes a multi-bandwidth RBF MMD between the SHARED vectors of
-        the d1-batch users and the d2-batch users. Unlike the per-user
-        InfoNCE in :meth:`_shared_user_nce_loss`, this term needs no
-        cross-domain identity correspondence -- ALL batch users (overlap
-        and non-overlap) participate. The returned terms apply stop-gradient
-        on the opposite domain, so domain A and B can have independent loss
-        weights while still being pulled toward each other's distribution.
-
-        Robustness to imbalanced batches:
-          * MMD's biased estimator is asymptotically unbiased with
-            normalisers ``1/n^2``, ``1/m^2``, ``1/(nm)`` baked in -- so
-            ``n != m`` is handled by construction.
-          * When either side has fewer than ``MIN_USERS`` unique users,
-            the K_yy / K_xx variance dominates, so we skip rather than
-            inject noise.
-          * Inputs are L2-normalised to make sigma selection robust to
-            absolute embedding scale.
-          * Multi-bandwidth (sum over a fixed sigma grid) reduces
-            sensitivity to a single bandwidth choice.
-        """
         if not (inter_d1.numel() and inter_d2.numel()):
             zero = torch.tensor(0.0, device=self.device)
             return zero, zero
@@ -1689,9 +1381,7 @@ class STPD(nn.Module):
         u1 = torch.unique(inter_d1[:, 0])
         u2 = torch.unique(inter_d2[:, 0])
 
-        # Guard against high-variance MMD estimates when either side has
-        # too few unique users (Copenhagen's joint sampling can produce
-        # heavily imbalanced d1/d2 splits when interaction counts differ).
+
         MIN_USERS = 4
         if u1.numel() < MIN_USERS or u2.numel() < MIN_USERS:
             zero = torch.tensor(0.0, device=self.device)
@@ -1724,14 +1414,7 @@ class STPD(nn.Module):
 
     @staticmethod
     def _mmd_rbf_multi(x, y, sigmas=(0.5, 1.0, 2.0, 4.0, 8.0)):
-        """Multi-bandwidth RBF MMD^2 between two unmatched sample sets.
 
-        Uses the squared-distance form
-            ``k(a,b) = exp(-||a-b||^2 / (2 sigma^2))``
-        and averages over the supplied bandwidths. ``x`` and ``y`` may
-        have different leading dimensions; the .mean() over each kernel
-        block handles the n^2 / m^2 / (n*m) normalisation automatically.
-        """
         xx = torch.cdist(x, x).pow(2)
         yy = torch.cdist(y, y).pow(2)
         xy = torch.cdist(x, y).pow(2)
@@ -1746,13 +1429,7 @@ class STPD(nn.Module):
         return loss / len(sigmas)
 
     def _lna_private_domain(self, users, items, private_emb, item_emb):
-        """In-batch contrastive loss on domain-private user vectors.
 
-        For each batch sample ``(u, i+)``, treat the scores between ``u``'s
-        private vector and every other in-batch positive item as negatives,
-        and push the diagonal (the user's own positive) above them via a
-        temperature-scaled softmax cross-entropy.
-        """
         if users.numel() < 2:
             return torch.tensor(0.0, device=self.device)
 
@@ -1863,31 +1540,10 @@ class STPD(nn.Module):
 
     @torch.no_grad()
     def _maybe_refresh_pseudo_pairs(self):
-        """Recompute every-anchor -> closest-overlap-partner mapping every
-        ``pseudo_overlap_refresh_every`` epochs.
 
-        Partner pool is restricted to OVERLAP users only (local ids
-        ``[0, n_shared)`` in the other domain): their other-domain history
-        is real interaction data, which gives high-quality positives.
-
-        For an overlap anchor (id ``< n_shared``) the closest is typically
-        itself in the other domain (same global user, similar Tag2
-        profile), and self-match is ALLOWED.
-
-        Result buffers:
-            ``_d1_partner_overlap`` : ``[d1_n_users]`` long, values in
-                ``[0, n_shared)`` -- closest overlap user in d2 by Tag2
-                profile cosine.
-            ``_d2_partner_overlap`` : symmetric for d2-side anchors.
-            ``_*_partner_valid``    : True iff that partner has a
-                non-empty training history in the OTHER domain.
-        """
         if not self.training or not self.has_tag_graphs:
             return
-        # Refresh whenever a consumer of the pseudo-overlap partner lookups
-        # is active: currently only the item-positive pseudo-overlap loss.
-        # The shared-vector user-user InfoNCE no longer relies on Tag2
-        # partner buffers (it operates purely on overlap-user ids).
+
         if self.pseudo_overlap_weight <= 0:
             return
 
@@ -1941,9 +1597,7 @@ class STPD(nn.Module):
         d2_partner = sim_d2.argmax(dim=1).long()                              # [d2_n_users]
         d2_best = sim_d2.gather(1, d2_partner.unsqueeze(1)).squeeze(1)
 
-        # Validity: partner must have a non-empty OTHER-domain training set.
-        # d1 anchor's partner is an overlap user; its OTHER-domain history is
-        # in d2 -> use ``_d2_ov_has_pos[partner]``.
+
         d1_valid = self._d2_ov_has_pos[d1_partner].clone()
         d2_valid = self._d1_ov_has_pos[d2_partner].clone()
 
@@ -1952,8 +1606,7 @@ class STPD(nn.Module):
         self._d1_partner_valid = d1_valid
         self._d2_partner_valid = d2_valid
 
-        # Diagnostic: how many overlap anchors are matched to themselves,
-        # and the sim distribution of all anchors' best partners.
+
         d1_self_match = ((d1_partner == torch.arange(self.d1_n_users, device=device)) & (torch.arange(self.d1_n_users, device=device) < n_s)).sum().item()
         d2_self_match = ((d2_partner == torch.arange(self.d2_n_users, device=device)) & (torch.arange(self.d2_n_users, device=device) < n_s)).sum().item()
         qs = torch.tensor([0.50, 0.90, 0.95, 0.99], device=device)
@@ -1974,14 +1627,7 @@ class STPD(nn.Module):
         )
 
     def _sample_one_overlap_pos(self, overlap_users, domain):
-        """Random-sample ONE training positive per overlap user.
 
-        ``overlap_users`` is a long tensor of overlap-user ids in
-        ``[0, n_shared)``; returns ``(pos_items, valid)`` where
-        ``valid[i]`` is True iff that overlap user has at least one
-        training positive in ``domain``. Items for invalid rows are
-        arbitrary (the caller masks them out via ``valid``).
-        """
         if domain == 1:
             offsets = self._d1_ov_pos_offsets
             items = self._d1_ov_pos_items
@@ -2020,11 +1666,7 @@ class STPD(nn.Module):
         return in_bounds & (pos_keys[idx] == keys)
 
     def _sample_overlap_bpr_items(self, overlap_users, domain):
-        """Sample one positive and one non-training negative for overlap users.
 
-        Returns only valid users: they must have at least one training positive
-        and at least one item outside their training positives in ``domain``.
-        """
         if overlap_users.numel() == 0:
             empty = overlap_users.new_empty(0)
             return empty, empty, empty
@@ -2084,21 +1726,7 @@ class STPD(nn.Module):
 
     def _pseudo_overlap_loss(self, s1, s2, inter_d1, inter_d2,
                              d1_item_emb, d2_item_emb):
-        """Standard 1-positive InfoNCE on the shared branch.
 
-        For each anchor user u in the batch:
-
-          1. partner v = ``_d{self}_partner_overlap[u]``                     # closest overlap user in OTHER domain
-          2. pos_item i_v ~ Uniform( v's other-domain training positives )  # one random sample
-          3. positive logit  = cos(s_{self}[u], item_emb[i_v]) / align_temp
-          4. negative logits = cos(s_{self}[u], item_emb[i_{v'}]) for every
-             OTHER anchor u' in the same batch                              # in-batch negatives
-          5. Anchors u' that share a partner with u (v' == v) are masked
-             off-diagonal as false negatives.
-
-        The two directions (d1 anchors -> d2 partner items, d2 anchors ->
-        d1 partner items) are computed independently and averaged.
-        """
         if self._d1_partner_overlap.numel() == 0:
             # Refresh hasn't populated buffers (training=False or first call).
             return torch.tensor(0.0, device=self.device)
@@ -2125,13 +1753,7 @@ class STPD(nn.Module):
     def _pseudo_overlap_one_side(self, inter_self, own_shared, other_item_emb,
                                  partner_lookup, partner_valid_lookup,
                                  other_domain):
-        """One direction of the 1-pos InfoNCE (see :meth:`_pseudo_overlap_loss`).
 
-        Builds a ``[A, A]`` similarity matrix between A anchors and the A
-        partner-sampled items; the i-th row's label is i. Anchors that
-        share a partner with anchor i contribute false-negative entries in
-        row i and are masked to ``-inf``.
-        """
         if inter_self.numel() == 0:
             return None
 
@@ -2162,9 +1784,7 @@ class STPD(nn.Module):
         # [A, A] in-batch logits: row i is anchor i, col j is partner-item j.
         logits = (u_e @ p_e.t()) / self.align_temp
 
-        # False-negative mask: off-diagonal entries where two anchors share
-        # the same partner (so j's positive is "the same person" as i's, not
-        # a true negative). Diagonal is the positive and must stay.
+
         same_partner = partners.unsqueeze(0) == partners.unsqueeze(1)          # [A, A]
         eye = torch.eye(A, dtype=torch.bool, device=logits.device)
         false_neg_mask = same_partner & ~eye
@@ -2225,29 +1845,20 @@ class STPD(nn.Module):
             l_b = self._lna_private_domain(inter_d2[:, 0], inter_d2[:, 1], p2, d2_item_emb)
             loss_lna = l_a + l_b
 
-        # Pseudo-overlap alignment on shared vectors via Tag2-closest overlap partner.
-        # ALL users (overlap + non-overlap) are mapped to their closest overlap
-        # user in the other domain; one random training positive of that partner
-        # becomes the anchor's positive in a standard in-batch 1-pos InfoNCE.
-        # Same-partner anchors mask each other as false negatives.
+
         loss_pseudo = torch.tensor(0.0, device=self.device)
         if self.pseudo_overlap_weight > 0 and self.has_tag_graphs:
             loss_pseudo = self._pseudo_overlap_loss(
                 s1, s2, inter_d1, inter_d2, d1_item_emb, d2_item_emb,
             )
 
-        # User-user InfoNCE on shared vectors: each anchor is pulled to its
-        # cross-domain partner and pushed away from all OTHER-domain overlap
-        # users plus OTHER-domain in-batch users.
+  
         loss_shared_user = torch.tensor(0.0, device=self.device)
         if self.shared_user_nce_weight > 0:
             loss_shared_user = self._shared_user_nce_loss(
                 s1, s2, inter_d1, inter_d2,
             )
 
-        # Directional MMD alignment between batch users' shared vectors.
-        # If ``shared_user_mmd_weight`` is non-zero, A/B both use that value;
-        # otherwise ``shared_user_mmd_weight_A/B`` control the two directions.
         loss_shared_mmd = torch.tensor(0.0, device=self.device)
         if (
             self.shared_user_mmd_weight_A != 0
@@ -2261,16 +1872,11 @@ class STPD(nn.Module):
                 + self.shared_user_mmd_weight_B * loss_shared_mmd_B
             )
 
-        # Paired overlap-user cosine alignment: a soft pull between the two
-        # domains' shared vectors for the same overlap identity, without
-        # adding noisy negatives.
+
         loss_overlap_cos = torch.tensor(0.0, device=self.device)
         if self.shared_overlap_cos_weight > 0:
             loss_overlap_cos = self._overlap_cos_loss(s1, s2, inter_d1, inter_d2)
 
-        # Shared-channel ranking distillation: the shared vector matches the
-        # fused user's detached pos-vs-neg margin instead of taking a direct
-        # auxiliary BPR target.
         loss_shared_distill = torch.tensor(0.0, device=self.device)
         if self.shared_distill_weight > 0:
             loss_shared_distill = (
@@ -2294,8 +1900,7 @@ class STPD(nn.Module):
             if cross_terms:
                 loss_shared_cross_bpr = sum(cross_terms) / len(cross_terms)
 
-        # Original standalone shared-channel BPR: directly supervise the
-        # shared user vector with the domain's own sampled positive/negative.
+
         loss_shared_bpr = torch.tensor(0.0, device=self.device)
         if self.shared_bpr_weight > 0:
             loss_shared_bpr = (
