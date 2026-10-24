@@ -3,171 +3,80 @@ rqvae_epochs: 120
 optim: Adam
 embedding_size: 128
 intra_domain_layers: 2
-# U-I LightGCN propagation depth (STPD only). Its input is the U/I-Tag
-# graph output, and it remains decoupled from `intra_domain_layers`.
-# If unset, falls back to `intra_domain_layers`.
+
 ui_graph_layers: 2
 reg_weight: 0.0001
 batch_size: 2048
 eval_batch_size: 4096
 drop_rate: 0
-# Keep RQ-VAE tag graphs, but do not transfer teacher_pretrain.pt by default.
-# Set true only for the explicit teacher-initialisation ablation.
+
 use_teacher_pretrain: false
-# Keep normal STPD's trainable I-Tag item tables on the legacy Xavier
-# random initialisation instead of injecting offline PCA content embeddings.
-# `wocross` keeps its independent legacy lookup path.
+
 use_pca_item_init: false
-# Copied PCA artifacts may record a source path/mtime from another machine.
-# Keep false to trust a cache whose domains, dimensions and row counts match.
+
 pca_item_validate_source: false
-# Tag graph topology still comes from the RQ-VAE codes. For the embedding
-# initialisation ablation use `random`; switch to `rqvae` for codebook vectors.
+
 tag_embedding_init: rqvae
-# Ablation: `none` uses real RQ-VAE codes; `shuffle` permutes item->code
-# assignments per domain (preserving cluster sizes and the Tag1-Tag2 edge
-# structure) to test whether semantic clustering matters or any random
-# partition of the same shape works equally well.
+
 tag_codes: none
-# Ablation: `free` = item Tag-anchor is a free nn.Embedding (default, can be
-# row-wise absorbed by the model). `content_proj` = freeze PCA content as the
-# anchor and learn only a 128x128 projection, so no per-item free parameter
-# exists and the Tag graph's cross-item smoothing becomes a real constraint.
-# Requires use_pca_item_init: true.
+
 item_anchor_mode: free
-# How the private/shared user split is produced.
-#   `gate`  : learned sigmoid gate on the LightGCN output (original). The
-#             shared branch is a free vector, so shared_cross_bpr / MMD
-#             gradients never reach the Tag parameters.
-#   `tag2`  : shared branch IS the Tag2 contribution of the Tag graph, so the
-#             shared-branch losses backpropagate through the shared Tag2
-#             bridge. Makes Tag load-bearing without adding a loss term.
+
 shared_split_mode: gate
 
-# Tag-graph topology.
-#   chain    : anchor - Tag1 - Tag2   (legacy; Tag2 is two hops from anchors)
-#   parallel : anchor - Tag1 and anchor - Tag2 as independent one-hop channels
-#   swapped  : anchor - Tag2 - Tag1   (swap propagation levels for ablation)
-# `chain` washes the per-anchor Tag2 signal out to a near-constant vector
-# because Tag1/Tag2 are nearly independent, making Tag1-Tag2 almost complete.
+
 tag_graph_topology: chain
 lambda_u_tag_sparse: 0
 lambda_i_tag_sparse: 0
 
-# Overlap-only item InfoNCE on the shared branch (`_xd_infonce_loss`).
-# Only users with u < n_shared act as anchors. For each anchor, two standard
-# 1-positive InfoNCE terms are averaged:
-#   - self positive: the batch positive item carried by this training sample
-#   - other positive: one random training positive of the same overlap user
-#                     in the other domain
-# Negatives are the in-batch positive items from BOTH domains, following Lna.
+
 align_weight: 0
 align_temp: 0.2
 ortho_weight: 0.05
 
-# Domain disentanglement immediately after the private/shared gate:
-#   - shared branch: domain discriminator + GRL (domain-adversarial)
-#   - private branch: same two-layer MLP discriminator, no GRL
-# Both losses use current-batch unique users from the two domains.
+
 shared_domain_adv_weight: 0
 private_domain_cls_weight: 0
 domain_grl_lambda: 1.0
 domain_disc_hidden_dim: 128
 
-# Lna: in-batch negative contrastive loss (no filtering)
+
 lna_weight: 0.7
 lna_temp: 0.2
 
-# Pseudo-overlap alignment via interacted-item Tag2 profile similarity.
-# ALL users (overlap + non-overlap) map to ONE closest partner in the
-# OTHER domain's OVERLAP user pool (ids < n_shared). Self-match is allowed
-# (overlap users typically pick themselves -> their own real cross-domain
-# history). Each batch step does a STANDARD 1-positive in-batch InfoNCE:
-# anchor = s_self[u]; positive = one random training item of u's partner
-# in the other domain; negatives = the other anchors' partner items in
-# the same batch (anchors sharing a partner are masked as false negatives).
-# Reuses ``align_temp`` for the temperature.
 pseudo_overlap_weight: 0
 pseudo_overlap_refresh_every: 3
 
-# User-user InfoNCE on the domain-shared vectors (s1, s2). OVERLAP-ONLY anchors.
-#
-# Anchors: overlap users (``u < n_shared``) that appear in this batch.
-#   They are the only users with a well-defined cross-domain identity.
-# Positive: ``s_other[u]`` -- same overlap user's shared vector in the
-#   OTHER domain.
-# Candidate pool: all OTHER-domain overlap users + OTHER-domain users in
-#   the current batch, deduplicated. Standard N-way InfoNCE: the positive
-#   is included once in the denominator. Non-overlap users are excluded as
-#   anchors, but OTHER-domain non-overlap batch users can be negatives.
-#
-# Logits use cosine similarity / ``align_temp``; the loss is symmetric
-# across d1 <-> d2.
 shared_user_nce_weight: 0
 
-# Distribution-level (MMD) alignment between batch users' shared vectors
-# across the two domains. Complementary to ``shared_user_nce_weight``:
-#   - Per-user InfoNCE only acts on OVERLAP anchors and requires identity
-#     correspondence. It cannot help non-overlap users.
-#   - MMD acts on ALL batch users (overlap + non-overlap) and aligns the
-#     whole shared-cloud DISTRIBUTION in feature space, not just paired
-#     identities. No correspondence needed.
-#
-# Implementation: multi-bandwidth RBF (sigmas = 0.5/1/2/4/8) over
-# L2-normalised batch shared vectors. Skipped on batches where either
-# side has fewer than 4 unique users (high-variance estimate).
-#
-# Weight mode:
-#   - If shared_user_mmd_weight != 0, both directions use this same value.
-#   - If shared_user_mmd_weight == 0, use the domain-specific directional
-#     weights below: A updates domain_1, B updates domain_2. The opposite
-#     domain is detached in each directional loss.
+
 shared_user_mmd_weight: 7
 shared_user_mmd_weight_A: 0
 shared_user_mmd_weight_B: 0
 
-# Paired overlap-user cosine alignment on the shared vectors:
-#   loss = 1 - cos(s1[u], s2[u]) for overlap users appearing in either
-#   domain's current batch. Unlike shared_user_nce, this only pulls the
-#   same identity together and does not introduce user negatives.
+
 shared_overlap_cos_weight: 0
 
-# Shared-channel ranking distillation: the final fused user vector is the
-# detached teacher, and the shared vector learns its pos-vs-neg margin
-# with MSE. Item vectors are detached in this loss so the auxiliary signal
-# mainly trains ``s``.
+
 shared_distill_weight: 0
 
-# Original standalone shared-channel BPR. Directly asks ``s1`` / ``s2`` to
-# rank each domain's own positive item above its sampled negative item.
-# This is independent from ``shared_distill_weight`` and can be ablated
-# separately.
+
 shared_bpr_weight: 0
 
-# Shared-channel cross-domain BPR. One symmetric weight controls both
-# source-domain shared branches:
-#   - d1/s1 in-domain shared BPR + s1 -> d2 overlap cross BPR.
-#   - d2/s2 in-domain shared BPR + s2 -> d1 overlap cross BPR.
-# Keep ``shared_bpr_weight`` at 0 to avoid double-counting in-domain BPR.
 shared_cross_bpr_weight: 3
 
-# RQ-VAE item code generation
-# rqvae_codebook_sizes: [n_tag1, n_tag2]
-# Codebook sharing pattern:
-#   private_shared : domain-specific Tag1, shared Tag2 (P->S baseline)
-#   shared_shared  : shared Tag1 and shared Tag2 (S->S ablation)
+
 rqvae_codebook_sharing: private_shared
-# Downstream U-Tag and I-Tag graphs keep independent role-specific parameters;
-# cross-domain Tag1 sharing follows the selected pattern and Tag2 stays shared.
+
 rqvae_codebook_sizes: [32, 32]
 rqvae_beta: 0.25
 rqvae_latent_dim: 128
 rqvae_tag2_align_temp: 0.2
-# JS divergence between overlap users' per-domain Tag2-interest distributions.
+
 rqvae_user_tag2_js_weight: 0.05
 rqvae_user_tag2_js_batch_size: 64
 
-# CrossAug: shared/specific split + augmentation + Householder
+
 shared_dim: 64
 n_layers: 2
 cbatch_size: 512
@@ -178,7 +87,7 @@ cdl: 0
 al: 0.5
 n_hh: 16
 
-# DisenCDR: disentangled cross-domain recommendation
+
 disen_feature_dim: 128
 disen_hidden_dim: 128
 disen_gnn_layers: 2
