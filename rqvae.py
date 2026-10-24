@@ -1,8 +1,3 @@
-"""
-Minimal RQ-VAE implementation for STPD teacher pre-training.
-Adapted from GenCDR/quantization/rqvae.
-"""
-
 import json
 import os
 
